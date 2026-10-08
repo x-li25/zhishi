@@ -1,7 +1,6 @@
 package com.zhishi.schedule.domain
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.time.LocalDate
@@ -47,80 +46,12 @@ class ScheduleEngineTest {
     }
 
     @Test
-    fun `meal suggestion is inside lunch window`() {
-        val day = engine.buildDay(
-            date = date,
-            zoneId = zone,
-            events = emptyList(),
-            preferences = SchedulePreferences(
-                dayStart = LocalTime.of(8, 0),
-                dayEnd = LocalTime.of(20, 0),
-                lunchStart = LocalTime.of(11, 30),
-                lunchEnd = LocalTime.of(13, 30)
-            )
-        )
-
-        val lunch = day.suggestions.first {
-            it.type == SuggestionType.MEAL && it.range.startOffsetMinutes() == 690L
-        }
-        assertEquals(690L, lunch.range.startOffsetMinutes())
-        assertEquals(45L, lunch.range.durationMinutes)
-    }
-
-    @Test
-    fun `study suggestion is capped at ninety minutes`() {
-        val day = engine.buildDay(
-            date = date,
-            zoneId = zone,
-            events = emptyList(),
-            preferences = SchedulePreferences(
-                dayStart = LocalTime.of(8, 0),
-                dayEnd = LocalTime.of(23, 0)
-            )
-        )
-
-        val study = day.suggestions.first { it.type == SuggestionType.STUDY }
-        assertTrue(study.range.durationMinutes <= 90L)
-    }
-
-    @Test
-    fun `study suggestions never overlap meal suggestions`() {
-        val day = engine.buildDay(
-            date = date,
-            zoneId = zone,
-            events = emptyList(),
-            preferences = SchedulePreferences(
-                dayStart = LocalTime.of(8, 0),
-                dayEnd = LocalTime.of(20, 0),
-                studyStart = LocalTime.of(8, 0),
-                studyEnd = LocalTime.of(20, 0),
-                lunchStart = LocalTime.of(11, 30),
-                lunchEnd = LocalTime.of(13, 30),
-                minStudyMinutes = 30
-            )
-        )
-
-        val meals = day.suggestions.filter { it.type == SuggestionType.MEAL }
-        val studies = day.suggestions.filter { it.type == SuggestionType.STUDY }
-        assertTrue(meals.isNotEmpty())
-        assertTrue(studies.isNotEmpty())
-        studies.forEach { study ->
-            meals.forEach { meal ->
-                assertFalse(
-                    "学习建议 ${study.range} 与餐时建议 ${meal.range} 重叠",
-                    study.range.overlaps(meal.range)
-                )
-            }
-        }
-    }
-
-    @Test
-    fun `fully busy day produces no free ranges or suggestions`() {
+    fun `fully busy day produces no free ranges`() {
         val events = listOf(
             CalendarEvent(
                 eventId = 1,
                 calendarId = 1,
-                title = "全天会议",
+                title = "整天会议",
                 startMillis = at(7, 0),
                 endMillis = at(23, 0),
                 allDay = false
@@ -135,7 +66,6 @@ class ScheduleEngineTest {
         )
 
         assertTrue(day.freeRanges.isEmpty())
-        assertTrue(day.suggestions.isEmpty())
     }
 
     @Test
@@ -163,6 +93,30 @@ class ScheduleEngineTest {
 
         assertEquals(1, day.freeRanges.size)
         assertEquals(180L, day.freeRanges.first().durationMinutes)
+    }
+
+    @Test
+    fun `overlapping events merge into one busy block`() {
+        val events = listOf(
+            CalendarEvent(1, 1, "a", at(9, 0), at(10, 30), allDay = false),
+            CalendarEvent(2, 1, "b", at(10, 0), at(11, 0), allDay = false)
+        )
+
+        val day = engine.buildDay(
+            date = date,
+            zoneId = zone,
+            events = events,
+            preferences = SchedulePreferences(
+                dayStart = LocalTime.of(9, 0),
+                dayEnd = LocalTime.of(12, 0),
+                bufferMinutes = 0
+            )
+        )
+
+        assertEquals(
+            listOf(660L to 720L),
+            day.freeRanges.map { it.startOffsetMinutes() to it.endOffsetMinutes() }
+        )
     }
 
     private fun at(hour: Int, minute: Int): Long =

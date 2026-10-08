@@ -2,6 +2,8 @@ package com.zhishi.schedule.ai
 
 import com.zhishi.schedule.domain.AiParseResult
 import com.zhishi.schedule.domain.CalendarEvent
+import com.zhishi.schedule.domain.ChatMessage
+import com.zhishi.schedule.domain.ChatRole
 import com.zhishi.schedule.domain.GlmConfig
 import com.zhishi.schedule.domain.ParsedActionType
 import com.zhishi.schedule.domain.ParsedEvent
@@ -44,8 +46,11 @@ class GlmClient {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    suspend fun interpret(
-        text: String,
+    /**
+     * 多轮对话：携带最近历史（记忆），返回助手的回复文本与日程操作。
+     */
+    suspend fun chat(
+        history: List<ChatMessage>,
         config: GlmConfig,
         now: Instant = Instant.now(),
         zoneId: ZoneId = ZoneId.systemDefault(),
@@ -53,20 +58,22 @@ class GlmClient {
         scheduleContext: String = ""
     ): AiParseResult = withContext(Dispatchers.IO) {
         require(config.isConfigured()) { "请先在设置中填写 API Key" }
-        require(text.isNotBlank()) { "请输入日程描述文字" }
+        require(history.isNotEmpty()) { "请输入内容" }
 
         val requestJson = buildJsonObject {
             put("model", config.model)
-            put("temperature", 0.1)
+            put("temperature", 0.3)
             put("messages", buildJsonArray {
                 add(buildJsonObject {
                     put("role", "system")
                     put("content", systemPrompt(now, zoneId, existingEvents, scheduleContext))
                 })
-                add(buildJsonObject {
-                    put("role", "user")
-                    put("content", text.trim())
-                })
+                history.takeLast(MAX_HISTORY_MESSAGES).forEach { message ->
+                    add(buildJsonObject {
+                        put("role", if (message.role == ChatRole.USER) "user" else "assistant")
+                        put("content", message.text)
+                    })
+                }
             })
             if (config.responseJsonMode) {
                 put("response_format", buildJsonObject { put("type", "json_object") })
@@ -132,7 +139,7 @@ class GlmClient {
         val content = extractMessageContent(message)
         val payload = extractJsonObject(content)
 
-        val summary = readString(payload, "summary").orEmpty()
+        val summary = readString(payload, "reply", "summary", "message").orEmpty()
         val questions = payload["questions"]?.jsonArray
             ?.mapNotNull { it.jsonPrimitive.contentOrNull }
             .orEmpty()
@@ -177,7 +184,9 @@ class GlmClient {
             title = title,
             startMillis = start,
             endMillis = end,
+            location = readString(action, "location", "place", "address"),
             reminderMinutes = readIntList(action, "reminders", "reminder_minutes"),
+            checklist = readStringList(action, "checklist", "checklist_items", "tasks", "todo"),
             confidence = readDouble(action, "confidence").coerceIn(0.0, 1.0),
             action = ParsedActionType.CREATE
         )
@@ -209,11 +218,14 @@ class GlmClient {
         }
         val reminders = readIntList(action, "reminders", "reminder_minutes")
             .ifEmpty { target.reminderMinutes }
+        val checklist = readStringList(action, "checklist", "checklist_items", "tasks", "todo")
         return ParsedEvent(
             title = title,
             startMillis = start,
             endMillis = end,
+            location = readString(action, "location", "place", "address") ?: target.location,
             reminderMinutes = reminders,
+            checklist = checklist,
             confidence = readDouble(action, "confidence").coerceIn(0.0, 1.0),
             action = ParsedActionType.UPDATE,
             targetEventId = target.eventId,
@@ -241,6 +253,7 @@ class GlmClient {
             title = target.title,
             startMillis = target.startMillis,
             endMillis = target.endMillis,
+            location = target.location,
             reminderMinutes = target.reminderMinutes,
             confidence = readDouble(action, "confidence").coerceIn(0.0, 1.0),
             action = ParsedActionType.DELETE,
@@ -299,6 +312,25 @@ class GlmClient {
     private fun readDouble(obj: JsonObject, key: String, fallback: Double = 0.8): Double {
         val value = obj[key] as? JsonPrimitive ?: return fallback
         return value.doubleOrNull ?: value.contentOrNull?.toDoubleOrNull() ?: fallback
+    }
+
+    private fun readStringList(obj: JsonObject, vararg keys: String): List<String> {
+        keys.forEach { key ->
+            val value = obj[key] ?: return@forEach
+            val list = when (value) {
+                is JsonArray -> value.mapNotNull { element ->
+                    element.jsonPrimitive.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                }
+                is JsonPrimitive -> value.contentOrNull
+                    ?.split('\n', '；', ';')
+                    ?.map { it.trim().trimStart('-', '•', '·').trim() }
+                    ?.filter { it.isNotEmpty() }
+                    .orEmpty()
+                else -> emptyList()
+            }
+            if (list.isNotEmpty()) return list
+        }
+        return emptyList()
     }
 
     private fun readIntList(obj: JsonObject, vararg keys: String): List<Int> {
@@ -395,30 +427,37 @@ class GlmClient {
                         .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
                     val end = Instant.ofEpochMilli(event.endMillis).atZone(zoneId)
                         .format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)
-                    "- id=${event.eventId} | title=${event.title} | start=$start | end=$end | recurring=${event.isRecurring}"
+                    val location = event.location?.takeIf { it.isNotBlank() }?.let { " | location=$it" }.orEmpty()
+                    "- id=${event.eventId} | title=${event.title} | start=$start | end=$end$location | recurring=${event.isRecurring}"
                 }
             }
         }
         return """
-            你是知时日程助手。你的任务是把用户提供的文字内容转换成日程操作。
-            只输出一个 JSON 对象，不要输出 Markdown、代码围栏、解释或额外文字。
+            你是“知时”App 内置的日程小助手，正在和用户进行多轮对话。利用对话历史记住用户说过的安排和偏好。
+            你的职责：理解用户想怎么安排时间，提出对应的日程操作，等用户确认后由 App 执行。
+            只输出一个 JSON 对象，不要输出 Markdown、代码围栏或额外文字。
             当前时间：${localNow.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)}
             时区：${zoneId.id}
             今天日期：${localNow.toLocalDate()}
             星期：${localNow.dayOfWeek}
 
             规则：
-            1. start/end 必须是带时区的 ISO-8601 时间，例如 2026-10-09T19:00:00+08:00。
-            2. 用户说“明天、今晚、下周一”等相对时间时，必须基于当前时间计算绝对时间。
-            3. 未说明结束时间时，可根据语义或常见时长推断；无法可靠推断时在 questions 中询问。
-            4. 只有用户明确要求新增或安排内容时才输出 create_event。
-            5. 只有用户明确要求修改、移动、改名或调整已有日程时才输出 update_event，并必须使用下方已有日程中的真实 id。
-            6. 只有用户明确要求删除、取消已有日程时才输出 delete_event，并必须使用真实 id。
-            7. 用户指代不明确、找不到目标日程或可能误删时，不要猜测 id；actions 为空，并在 questions 中说明需要确认什么。
-            8. 多个新建日程会产生多个 create_event。
-            9. 不要编造用户没有提供的标题、日期或关键时间。置信度用 0 到 1 表示。
-            10. reminders 使用分钟数组，例如提前 10 分钟为 [10]；未提及时可省略。
-            11. 标注“全天日程”的条目不支持修改或删除，不要对它们输出 update_event 或 delete_event。
+            1. reply 是给用户看的简短中文回复，语气自然，像聊天一样。
+            2. start/end 必须是带时区的 ISO-8601 时间，例如 2026-10-09T19:00:00+08:00。
+            3. 用户说“明天、今晚、下周一”等相对时间时，必须基于当前时间计算绝对时间。
+            4. 未说明结束时间时，可根据语义或常见时长推断；无法可靠推断时在 reply 中询问，不要输出 actions。
+            5. 只有用户明确要求新增或安排内容时才输出 create_event。
+            6. 只有用户明确要求修改、移动、改名或调整已有日程时才输出 update_event，并必须使用下方已有日程中的真实 id。
+            7. 只有用户明确要求删除、取消已有日程时才输出 delete_event，并必须使用真实 id。
+            8. 用户指代不明确、找不到目标日程或可能误删时，不要猜测 id；actions 为空，并在 reply 中说明需要确认什么。
+            9. 多个新建日程会产生多个 create_event。
+            10. 不要编造用户没有提供的标题、日期、地点或关键时间。置信度用 0 到 1 表示。
+            11. location 为可选的地点字符串，用户提到地点时填写，例如“六教6A414”。
+            12. reminders 使用分钟数组，例如提前 10 分钟为 [10]；未提及时可省略。
+            13. 标注“全天日程”的条目不支持修改或删除，不要对它们输出 update_event 或 delete_event。
+            14. 用户只是闲聊、查询或确认时，actions 为空，正常用 reply 回答即可。
+            15. 用户要新建“复习”或“预习”类日程时，如果没有同时给出具体内容，先不要输出 create_event，用 reply 询问用户有没有复习/预习清单、清单里有哪些条目；用户回答后再输出带 checklist 的 create_event。
+            16. checklist 是字符串数组，表示该日程的任务清单，例如 ["高数第三章习题", "错题回顾"]。其他类型日程，用户主动提供了清单时也填写 checklist，但不要主动询问。
 
             已有日程：
             $eventList
@@ -428,13 +467,15 @@ class GlmClient {
 
             只输出以下结构：
             {
-              "summary": "简短说明本次识别结果",
+              "reply": "给用户看的简短回复",
               "actions": [
                 {
                   "type": "create_event",
                   "title": "复习数学",
                   "start": "2026-10-09T19:00:00+08:00",
                   "end": "2026-10-09T20:00:00+08:00",
+                  "location": "图书馆三层",
+                  "checklist": ["第三章习题", "错题回顾"],
                   "reminders": [10],
                   "confidence": 0.95
                 },
@@ -454,11 +495,12 @@ class GlmClient {
               ],
               "questions": []
             }
-            actions 为空时也必须保留 actions 和 questions 字段。
+            actions 为空时也必须保留 reply、actions 和 questions 字段。
         """.trimIndent()
     }
 
     companion object {
+        private const val MAX_HISTORY_MESSAGES = 20
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaTypeOrNull()
         private val CREATE_TYPES = setOf("create_event", "create", "add_event")
         private val UPDATE_TYPES = setOf(

@@ -2,6 +2,7 @@ package com.zhishi.schedule.ui.screens
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,30 +30,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.zhishi.schedule.domain.GlmConfig
-import com.zhishi.schedule.domain.SchedulePreferences
-import java.time.LocalTime
 
 @Composable
 fun SettingsScreen(
     config: GlmConfig,
-    preferences: SchedulePreferences,
     testingConnection: Boolean,
     onSaveConfig: (GlmConfig) -> Unit,
-    onTestConnection: (GlmConfig) -> Unit,
-    onSavePreferences: (SchedulePreferences) -> Unit
+    onTestConnection: (GlmConfig) -> Unit
 ) {
     var baseUrl by remember(config) { mutableStateOf(config.baseUrl) }
     var apiKey by remember(config) { mutableStateOf(config.apiKey) }
     var model by remember(config) { mutableStateOf(config.model) }
     var jsonMode by remember(config) { mutableStateOf(config.responseJsonMode) }
-
-    var minStudy by remember(preferences) { mutableStateOf(preferences.minStudyMinutes.toString()) }
-    var buffer by remember(preferences) { mutableStateOf(preferences.bufferMinutes.toString()) }
-    var studyStart by remember(preferences) { mutableStateOf(preferences.studyStart.toString()) }
-    var studyEnd by remember(preferences) { mutableStateOf(preferences.studyEnd.toString()) }
-    var lunchStart by remember(preferences) { mutableStateOf(preferences.lunchStart.toString()) }
-    var lunchEnd by remember(preferences) { mutableStateOf(preferences.lunchEnd.toString()) }
-    var prefError by remember { mutableStateOf<String?>(null) }
 
     fun currentConfig() = config.copy(
         baseUrl = baseUrl,
@@ -63,7 +52,7 @@ fun SettingsScreen(
 
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(20.dp),
+        contentPadding = PaddingValues(20.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
         item {
@@ -148,68 +137,6 @@ fun SettingsScreen(
         }
 
         item {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("排程偏好", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Spacer(Modifier.height(10.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CompactField(studyStart, { studyStart = it }, "学习开始", Modifier.weight(1f))
-                        CompactField(studyEnd, { studyEnd = it }, "学习结束", Modifier.weight(1f))
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CompactField(lunchStart, { lunchStart = it }, "午餐开始", Modifier.weight(1f))
-                        CompactField(lunchEnd, { lunchEnd = it }, "午餐结束", Modifier.weight(1f))
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        CompactField(minStudy, { minStudy = it }, "最短学习分钟", Modifier.weight(1f))
-                        CompactField(buffer, { buffer = it }, "事件缓冲（分钟）", Modifier.weight(1f))
-                    }
-                    prefError?.let {
-                        Spacer(Modifier.height(8.dp))
-                        Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = {
-                            val sStart = parseTimeOrNull(studyStart)
-                            val sEnd = parseTimeOrNull(studyEnd)
-                            val lStart = parseTimeOrNull(lunchStart)
-                            val lEnd = parseTimeOrNull(lunchEnd)
-                            when {
-                                sStart == null || sEnd == null || lStart == null || lEnd == null ->
-                                    prefError = "时间格式应为 HH:mm，例如 08:30"
-                                sStart >= sEnd ->
-                                    prefError = "学习开始时间必须早于学习结束时间"
-                                lStart >= lEnd ->
-                                    prefError = "午餐开始时间必须早于午餐结束时间"
-                                else -> {
-                                    prefError = null
-                                    onSavePreferences(
-                                        preferences.copy(
-                                            studyStart = sStart,
-                                            studyEnd = sEnd,
-                                            lunchStart = lStart,
-                                            lunchEnd = lEnd,
-                                            minStudyMinutes = minStudy.toIntOrNull()?.coerceAtLeast(10)
-                                                ?: preferences.minStudyMinutes,
-                                            bufferMinutes = buffer.toIntOrNull()?.coerceIn(0, 60)
-                                                ?: preferences.bufferMinutes
-                                        )
-                                    )
-                                }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text("保存排程偏好")
-                    }
-                }
-            }
-        }
-
-        item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -217,28 +144,9 @@ fun SettingsScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("当前策略", fontWeight = FontWeight.SemiBold)
                     Spacer(Modifier.height(6.dp))
-                    Text("AI 只负责理解与提出操作，所有时间与日历变更都需要确认后在手机本地执行。")
+                    Text("知时助手在对话中记住你的安排，提出的日程变更需要你确认后才会写入系统日历。")
                 }
             }
         }
     }
 }
-
-@Composable
-private fun CompactField(
-    value: String,
-    onValueChange: (String) -> Unit,
-    label: String,
-    modifier: Modifier
-) {
-    OutlinedTextField(
-        value = value,
-        onValueChange = onValueChange,
-        modifier = modifier,
-        label = { Text(label, maxLines = 1) },
-        singleLine = true
-    )
-}
-
-private fun parseTimeOrNull(value: String): LocalTime? =
-    runCatching { LocalTime.parse(value.trim()) }.getOrNull()

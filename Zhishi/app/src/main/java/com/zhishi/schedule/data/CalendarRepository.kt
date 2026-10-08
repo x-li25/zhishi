@@ -155,6 +155,7 @@ class CalendarRepository(private val context: Context) {
             put(CalendarContract.Events.DTSTART, event.startMillis)
             put(CalendarContract.Events.DTEND, event.endMillis)
             put(CalendarContract.Events.EVENT_TIMEZONE, zoneId.id)
+            put(CalendarContract.Events.EVENT_LOCATION, event.location)
             put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.isEmpty()) 0 else 1)
         }
         val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
@@ -183,6 +184,7 @@ class CalendarRepository(private val context: Context) {
                 put(CalendarContract.Events.DTSTART, event.startMillis)
                 put(CalendarContract.Events.DTEND, event.endMillis)
                 put(CalendarContract.Events.EVENT_TIMEZONE, zoneId.id)
+                put(CalendarContract.Events.EVENT_LOCATION, event.location)
                 put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.isEmpty()) 0 else 1)
             }
             val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
@@ -194,9 +196,13 @@ class CalendarRepository(private val context: Context) {
     }
 
     suspend fun deleteEvent(event: ParsedEvent) {
+        deleteEventById(event.targetEventId ?: error("缺少要删除的日程 ID"))
+    }
+
+    /** 手动删除入口：按事件 ID 删除，沿用全天/重复日程保护。 */
+    suspend fun deleteEventById(eventId: Long) {
         withContext(Dispatchers.IO) {
             check(hasWritePermission()) { "没有日历写入权限" }
-            val eventId = event.targetEventId ?: error("缺少要删除的日程 ID")
             ensureEditable(eventId)
             val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
             if (context.contentResolver.delete(uri, null, null) <= 0) {

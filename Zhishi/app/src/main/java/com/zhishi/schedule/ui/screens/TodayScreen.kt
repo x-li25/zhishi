@@ -10,15 +10,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.CalendarMonth
 import androidx.compose.material.icons.outlined.ChevronLeft
 import androidx.compose.material.icons.outlined.ChevronRight
-import androidx.compose.material.icons.outlined.Event
-import androidx.compose.material.icons.outlined.Restaurant
-import androidx.compose.material.icons.outlined.School
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -31,13 +25,10 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.zhishi.schedule.data.CompletionStore
+import com.zhishi.schedule.data.ChecklistStore
 import com.zhishi.schedule.domain.CalendarEvent
-import com.zhishi.schedule.domain.ScheduleSuggestion
-import com.zhishi.schedule.domain.SuggestionType
 import com.zhishi.schedule.util.AppDateFormat
 
 @Composable
@@ -47,8 +38,8 @@ fun TodayScreen(
     onRequestCalendarPermission: () -> Unit,
     onPreviousDay: () -> Unit,
     onNextDay: () -> Unit,
-    onToggleCompleted: (CalendarEvent) -> Unit,
-    onAddSuggestion: (SuggestionType, String, Long, Long) -> Unit
+    onOpenDetail: (CalendarEvent) -> Unit,
+    onDeleteEvent: (CalendarEvent) -> Unit
 ) {
     val day = state.daySchedule
     LazyColumn(
@@ -80,12 +71,21 @@ fun TodayScreen(
                                 color = MaterialTheme.colorScheme.primary
                             )
                             val events = day?.events.orEmpty()
-                            val doneCount = events.count { CompletionStore.keyOf(it) in state.completedKeys }
+                            val doneCount = events.count { event ->
+                                val items = state.checklists[ChecklistStore.keyOf(event)].orEmpty()
+                                items.isNotEmpty() && items.all { it.done }
+                            }
+                            val dayRatings = events.mapNotNull {
+                                state.ratings[ChecklistStore.keyOf(it)]
+                            }
+                            val avgText = if (dayRatings.isEmpty()) ""
+                            else " · 平均自评 ${"%.1f".format(dayRatings.average())}★"
                             Text(
                                 text = when {
                                     state.loading -> "正在读取日历…"
                                     events.isEmpty() -> "0 个日程"
-                                    else -> "${events.size} 个日程 · 已完成 $doneCount"
+                                    doneCount > 0 -> "${events.size} 个日程 · 清单完成 $doneCount$avgText"
+                                    else -> "${events.size} 个日程$avgText"
                                 },
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -104,17 +104,22 @@ fun TodayScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         day.events.isEmpty() -> Text(
-                            text = "这一天还没有日程，可以在“识别”页用文字快速添加。",
+                            text = "这一天还没有日程，可以在“助手”页告诉 AI 你的安排。",
                             modifier = Modifier.padding(16.dp),
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         else -> Column(modifier = Modifier.padding(horizontal = 12.dp)) {
                             day.events.forEachIndexed { index, event ->
+                                val checklist = state.checklists[ChecklistStore.keyOf(event)].orEmpty()
                                 EventRow(
                                     event = event,
-                                    completed = CompletionStore.keyOf(event) in state.completedKeys,
-                                    onToggleCompleted = { onToggleCompleted(event) }
+                                    checklistDone = checklist.count { it.done },
+                                    checklistTotal = checklist.size,
+                                    rating = state.ratings[ChecklistStore.keyOf(event)],
+                                    onOpenDetail = if (checklist.isEmpty()) null
+                                    else ({ onOpenDetail(event) }),
+                                    onLongPress = { onDeleteEvent(event) }
                                 )
                                 if (index < day.events.lastIndex) {
                                     HorizontalDivider(
@@ -136,15 +141,14 @@ fun TodayScreen(
             }
         }
 
-        item {
-            SectionTitle("空闲与建议")
-        }
-
         if (day != null) {
             val freeText = day.freeRanges
                 .filter { it.durationMinutes >= 20 }
                 .take(4)
                 .joinToString("  ·  ") { AppDateFormat.timeRange(it.startMillis, it.endMillis) }
+            item {
+                SectionTitle("空闲时间")
+            }
             item {
                 Card(
                     modifier = Modifier.fillMaxWidth(),
@@ -155,35 +159,6 @@ fun TodayScreen(
                         Spacer(Modifier.height(6.dp))
                         Text(if (freeText.isBlank()) "今天剩余空闲时间较少" else freeText)
                     }
-                }
-            }
-
-            if (day.suggestions.isEmpty()) {
-                item {
-                    EmptyCard(
-                        icon = Icons.Outlined.School,
-                        title = "暂时没有合适建议",
-                        subtitle = "可以放宽学习时间范围，或减少事件之间的缓冲时间。"
-                    )
-                }
-            } else {
-                items(day.suggestions) { suggestion ->
-                    SuggestionCard(
-                        suggestion = suggestion,
-                        onAdd = {
-                            val title = if (suggestion.type == SuggestionType.MEAL) {
-                                suggestion.title
-                            } else {
-                                "学习"
-                            }
-                            onAddSuggestion(
-                                suggestion.type,
-                                title,
-                                suggestion.range.startMillis,
-                                suggestion.range.endMillis
-                            )
-                        }
-                    )
                 }
             }
         }
@@ -225,67 +200,4 @@ private fun SectionTitle(text: String) {
         fontWeight = FontWeight.Bold,
         modifier = Modifier.padding(top = 4.dp)
     )
-}
-
-@Composable
-private fun EmptyCard(icon: ImageVector, title: String, subtitle: String) {
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Row(
-            modifier = Modifier.padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-            Column(modifier = Modifier.padding(start = 14.dp)) {
-                Text(title, fontWeight = FontWeight.SemiBold)
-                Text(
-                    subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun SuggestionCard(
-    suggestion: ScheduleSuggestion,
-    onAdd: () -> Unit
-) {
-    val icon = when (suggestion.type) {
-        SuggestionType.STUDY -> Icons.Outlined.School
-        SuggestionType.MEAL -> Icons.Outlined.Restaurant
-        else -> Icons.Outlined.Event
-    }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                Text(
-                    text = suggestion.title,
-                    modifier = Modifier.padding(start = 10.dp),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = AppDateFormat.timeRange(suggestion.range.startMillis, suggestion.range.endMillis),
-                style = MaterialTheme.typography.titleSmall,
-                color = MaterialTheme.colorScheme.primary
-            )
-            Text(
-                text = suggestion.reason,
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-            Spacer(Modifier.height(10.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                AssistChip(
-                    onClick = onAdd,
-                    label = { Text("加入日历") }
-                )
-            }
-        }
-    }
 }

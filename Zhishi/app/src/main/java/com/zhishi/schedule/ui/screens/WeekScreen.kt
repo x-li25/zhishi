@@ -35,8 +35,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.zhishi.schedule.data.CompletionStore
+import com.zhishi.schedule.data.ChecklistStore
 import com.zhishi.schedule.domain.CalendarEvent
+import com.zhishi.schedule.domain.ChecklistItem
 import com.zhishi.schedule.domain.DaySchedule
 import com.zhishi.schedule.util.AppDateFormat
 import java.time.LocalDate
@@ -47,7 +48,8 @@ fun WeekScreen(
     onPreviousWeek: () -> Unit,
     onNextWeek: () -> Unit,
     onCurrentWeek: () -> Unit,
-    onToggleCompleted: (CalendarEvent) -> Unit
+    onOpenDetail: (CalendarEvent) -> Unit,
+    onDeleteEvent: (CalendarEvent) -> Unit
 ) {
     var expandedDate by remember { mutableStateOf(LocalDate.now()) }
     val weekEnd = state.weekStart.plusDays(6)
@@ -149,11 +151,13 @@ fun WeekScreen(
                 WeekDayCard(
                     day = day,
                     expanded = expandedDate == day.date,
-                    completedKeys = state.completedKeys,
+                    checklists = state.checklists,
+                    ratings = state.ratings,
                     onToggleExpand = {
                         expandedDate = if (expandedDate == day.date) LocalDate.MIN else day.date
                     },
-                    onToggleCompleted = onToggleCompleted
+                    onOpenDetail = onOpenDetail,
+                    onDeleteEvent = onDeleteEvent
                 )
             }
         }
@@ -164,12 +168,17 @@ fun WeekScreen(
 private fun WeekDayCard(
     day: DaySchedule,
     expanded: Boolean,
-    completedKeys: Set<String>,
+    checklists: Map<String, List<ChecklistItem>>,
+    ratings: Map<String, Int>,
     onToggleExpand: () -> Unit,
-    onToggleCompleted: (CalendarEvent) -> Unit
+    onOpenDetail: (CalendarEvent) -> Unit,
+    onDeleteEvent: (CalendarEvent) -> Unit
 ) {
     val isToday = day.date == LocalDate.now()
-    val doneCount = day.events.count { CompletionStore.keyOf(it) in completedKeys }
+    val doneCount = day.events.count { event ->
+        val items = checklists[ChecklistStore.keyOf(event)].orEmpty()
+        items.isNotEmpty() && items.all { it.done }
+    }
     val freeText = day.freeRanges
         .filter { it.durationMinutes >= 30 }
         .take(2)
@@ -197,10 +206,10 @@ private fun WeekDayCard(
                         else MaterialTheme.colorScheme.onSurface
                     )
                     Text(
-                        text = if (day.events.isEmpty()) {
-                            "没有日程"
-                        } else {
-                            "${day.events.size} 个日程 · 已完成 $doneCount"
+                        text = when {
+                            day.events.isEmpty() -> "没有日程"
+                            doneCount > 0 -> "${day.events.size} 个日程 · 清单完成 $doneCount"
+                            else -> "${day.events.size} 个日程"
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -224,10 +233,15 @@ private fun WeekDayCard(
                 HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
                 Column {
                     day.events.forEachIndexed { index, event ->
+                        val checklist = checklists[ChecklistStore.keyOf(event)].orEmpty()
                         EventRow(
                             event = event,
-                            completed = CompletionStore.keyOf(event) in completedKeys,
-                            onToggleCompleted = { onToggleCompleted(event) }
+                            checklistDone = checklist.count { it.done },
+                            checklistTotal = checklist.size,
+                            rating = ratings[ChecklistStore.keyOf(event)],
+                            onOpenDetail = if (checklist.isEmpty()) null
+                            else ({ onOpenDetail(event) }),
+                            onLongPress = { onDeleteEvent(event) }
                         )
                         if (index < day.events.lastIndex) {
                             HorizontalDivider(

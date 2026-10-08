@@ -1,5 +1,6 @@
 package com.zhishi.schedule.domain
 
+import kotlinx.serialization.Serializable
 import java.time.Duration
 import java.time.Instant
 import java.time.LocalDate
@@ -32,32 +33,20 @@ data class TimeRange(
 data class SchedulePreferences(
     val dayStart: LocalTime = LocalTime.of(7, 0),
     val dayEnd: LocalTime = LocalTime.of(23, 0),
-    val studyStart: LocalTime = LocalTime.of(8, 0),
-    val studyEnd: LocalTime = LocalTime.of(22, 0),
-    val lunchStart: LocalTime = LocalTime.of(11, 30),
-    val lunchEnd: LocalTime = LocalTime.of(13, 30),
-    val dinnerStart: LocalTime = LocalTime.of(17, 0),
-    val dinnerEnd: LocalTime = LocalTime.of(19, 30),
-    val minStudyMinutes: Int = 30,
     val bufferMinutes: Int = 10
 )
 
-enum class SuggestionType { STUDY, MEAL, BREAK, OTHER }
-
-data class ScheduleSuggestion(
-    val type: SuggestionType,
-    val title: String,
-    val range: TimeRange,
-    val reason: String
-)
-
+@Serializable
 enum class ParsedActionType { CREATE, UPDATE, DELETE }
 
+@Serializable
 data class ParsedEvent(
     val title: String,
     val startMillis: Long,
     val endMillis: Long,
+    val location: String? = null,
     val reminderMinutes: List<Int> = emptyList(),
+    val checklist: List<String> = emptyList(),
     val confidence: Double = 0.8,
     val action: ParsedActionType = ParsedActionType.CREATE,
     val targetEventId: Long? = null,
@@ -66,12 +55,32 @@ data class ParsedEvent(
     val originalEndMillis: Long? = null
 )
 
+@Serializable
+data class ChecklistItem(
+    val text: String,
+    val done: Boolean = false
+)
+
 data class AiParseResult(
     val summary: String,
     val events: List<ParsedEvent>,
     val questions: List<String> = emptyList(),
     val warnings: List<String> = emptyList(),
     val rawJson: String = ""
+)
+
+@Serializable
+enum class ChatRole { USER, ASSISTANT }
+
+@Serializable
+data class ChatMessage(
+    val id: Long,
+    val role: ChatRole,
+    val text: String,
+    val timestamp: Long = 0L,
+    val actions: List<ParsedEvent> = emptyList(),
+    val warnings: List<String> = emptyList(),
+    val executed: Boolean = false
 )
 
 data class GlmConfig(
@@ -87,6 +96,5 @@ data class DaySchedule(
     val date: LocalDate,
     val zoneId: ZoneId,
     val events: List<CalendarEvent>,
-    val freeRanges: List<TimeRange>,
-    val suggestions: List<ScheduleSuggestion>
+    val freeRanges: List<TimeRange>
 )
