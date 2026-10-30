@@ -1,6 +1,16 @@
 ﻿<vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
-    <path android:fillColor="#315C4C" android:pathData="M22,28h64a8,8 0,0 1,8 8v42a8,8 0,0 1,-8 8H22a8,8 0,0 1,-8 -8V36a8,8 0,0 1,8 -8z" />
-    <path android:fillColor="#FFFFFF" android:pathData="M31,42h46v7H31zM31,57h28v7H31z" />
-    <path android:fillColor="#F2C94C" android:pathData="M72,56h12v16H72z" />
+    <!-- Transparent cutouts preserve the calendar and clock in themed icons too.
+         The entire mark stays inside the adaptive icon's central safe circle. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:fillType="evenOdd"
+        android:pathData="M38,33 L70,33 C75,33 79,37 79,42 L79,71 C79,76 75,80 70,80 L38,80 C33,80 29,76 29,71 L29,42 C29,37 33,33 38,33 Z
+            M37.5,43 L70.5,43 C72.5,43 72.5,46 70.5,46 L37.5,46 C35.5,46 35.5,43 37.5,43 Z
+            M54,49 C60.627,49 66,54.373 66,61 C66,67.627 60.627,73 54,73 C47.373,73 42,67.627 42,61 C42,54.373 47.373,49 54,49 Z
+            M54,52 C49.029,52 45,56.029 45,61 C45,65.971 49.029,70 54,70 C58.971,70 63,65.971 63,61 C63,56.029 58.971,52 54,52 Z
+            M52.5,55 C52.5,53 55.5,53 55.5,55 L55.5,60.2 L60.25,62.95 C61.98,63.95 60.48,66.55 58.75,65.55 L53.25,62.3 C52.8,62.05 52.5,61.55 52.5,61 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M37,30 C37,26 43,26 43,30 L43,36 L37,36 Z M65,30 C65,26 71,26 71,30 L71,36 L65,36 Z" />
 </vector>

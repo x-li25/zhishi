@@ -13,8 +13,8 @@ android {
         applicationId = "com.zhishi.schedule"
         minSdk = 26
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.6.0"
+        versionCode = 51
+        versionName = "0.9.34"
     }
 
     buildTypes {
@@ -42,6 +42,10 @@ android {
         buildConfig = true
     }
 
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
+
     packaging {
         resources.excludes += "/META-INF/{AL2.0,LGPL2.1}"
     }
@@ -61,7 +65,10 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.3")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
