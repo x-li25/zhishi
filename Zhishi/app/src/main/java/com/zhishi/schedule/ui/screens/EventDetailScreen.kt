@@ -11,8 +11,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.Star
-import androidx.compose.material.icons.outlined.Star
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -21,13 +21,17 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
@@ -43,9 +47,9 @@ import com.zhishi.schedule.util.AppDateFormat
 fun EventDetailScreen(
     event: CalendarEvent,
     items: List<ChecklistItem>,
-    rating: Int?,
     onToggleItem: (Int) -> Unit,
-    onRate: (Int) -> Unit,
+    onAddItem: (String) -> Unit,
+    onRemoveItem: (Int) -> Unit,
     onBack: () -> Unit
 ) {
     val doneCount = items.count { it.done }
@@ -130,6 +134,7 @@ fun EventDetailScreen(
 
             Card {
                 Column {
+                    var newItemText by remember(event) { mutableStateOf("") }
                     items.forEachIndexed { index, item ->
                         if (index > 0) {
                             HorizontalDivider(
@@ -153,56 +158,62 @@ fun EventDetailScreen(
                                 textDecoration = if (item.done) TextDecoration.LineThrough else null,
                                 modifier = Modifier
                                     .padding(start = 4.dp)
+                                    .weight(1f)
                                     .alpha(if (item.done) 0.5f else 1f)
+                            )
+                            // 手动删除清单条目
+                            IconButton(
+                                onClick = { onRemoveItem(index) },
+                                modifier = Modifier.padding(end = 4.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Close,
+                                    contentDescription = "删除条目",
+                                    tint = MaterialTheme.colorScheme.outline
+                                )
+                            }
+                        }
+                    }
+                    HorizontalDivider(
+                        modifier = Modifier.padding(start = 52.dp),
+                        color = MaterialTheme.colorScheme.outlineVariant
+                    )
+                    // 手动添加清单条目
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        OutlinedTextField(
+                            value = newItemText,
+                            onValueChange = { newItemText = it },
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(vertical = 4.dp),
+                            placeholder = { Text("添加清单条目…") },
+                            singleLine = true,
+                            textStyle = MaterialTheme.typography.bodyLarge
+                        )
+                        IconButton(
+                            onClick = {
+                                onAddItem(newItemText)
+                                newItemText = ""
+                            },
+                            enabled = newItemText.isNotBlank()
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.Add,
+                                contentDescription = "添加条目",
+                                tint = if (newItemText.isNotBlank()) MaterialTheme.colorScheme.primary
+                                else MaterialTheme.colorScheme.outline
                             )
                         }
                     }
                 }
             }
 
-            // 清单全部勾完后出现自我打分
-            if (items.isNotEmpty() && doneCount == items.size) {
-                Spacer(Modifier.height(16.dp))
-                Card(
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.primaryContainer
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = if (rating == null) "任务完成！给自己打个分吧"
-                            else "本次自评 $rating 分，点星星可修改",
-                            style = MaterialTheme.typography.titleSmall,
-                            fontWeight = FontWeight.Bold
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        Row {
-                            (1..5).forEach { star ->
-                                IconButton(onClick = { onRate(star) }) {
-                                    Icon(
-                                        imageVector = if (rating != null && star <= rating) {
-                                            Icons.Filled.Star
-                                        } else {
-                                            Icons.Outlined.Star
-                                        },
-                                        contentDescription = "$star 星",
-                                        tint = StarColor
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
             Spacer(Modifier.height(24.dp))
         }
     }
 }
-
-/** 评分星星的统一颜色（琥珀金）。 */
-internal val StarColor = Color(0xFFF5A623)

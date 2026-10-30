@@ -25,6 +25,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.zhishi.schedule.domain.CalendarEvent
 import com.zhishi.schedule.util.AppDateFormat
@@ -39,7 +40,6 @@ fun EventRow(
     event: CalendarEvent,
     checklistDone: Int,
     checklistTotal: Int,
-    rating: Int?,
     onOpenDetail: (() -> Unit)?,
     onLongPress: () -> Unit,
     modifier: Modifier = Modifier
@@ -52,6 +52,8 @@ fun EventRow(
             .clip(RoundedCornerShape(8.dp))
             // 单击进清单二级页（有清单时），长按弹出删除确认；长按有涟漪画面反馈
             .combinedClickable(
+                onClickLabel = "查看日程详情",
+                onLongClickLabel = "删除日程",
                 onClick = { onOpenDetail?.invoke() },
                 onLongClick = onLongPress
             )
@@ -78,31 +80,26 @@ fun EventRow(
                 text = event.title,
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
                 textDecoration = if (completed) TextDecoration.LineThrough else null
             )
             event.location?.takeIf { it.isNotBlank() }?.let {
                 Text(
                     text = it,
                     style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
             if (hasChecklist) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "清单 $checklistDone/$checklistTotal" +
-                            (rating?.let { "  " + "★".repeat(it) + "☆".repeat(5 - it) } ?: ""),
+                        text = "清单 $checklistDone/$checklistTotal",
                         style = MaterialTheme.typography.bodySmall,
                         color = if (completed) MaterialTheme.colorScheme.onSurfaceVariant
                         else MaterialTheme.colorScheme.primary
-                    )
-                    // 可点进二级页的提示箭头跟在“清单”文字右侧，不占右侧时间列的位置
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                        contentDescription = "查看清单",
-                        tint = if (completed) MaterialTheme.colorScheme.onSurfaceVariant
-                        else MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.height(16.dp)
                     )
                 }
             }
@@ -133,6 +130,8 @@ fun EventRow(
                 )
             }
         }
+        if (onOpenDetail != null) Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.width(18.dp))
     }
 }
 
@@ -142,7 +141,6 @@ fun EventCard(
     event: CalendarEvent,
     checklistDone: Int,
     checklistTotal: Int,
-    rating: Int?,
     onOpenDetail: (() -> Unit)?,
     onLongPress: () -> Unit
 ) {
@@ -151,7 +149,6 @@ fun EventCard(
             event = event,
             checklistDone = checklistDone,
             checklistTotal = checklistTotal,
-            rating = rating,
             onOpenDetail = onOpenDetail,
             onLongPress = onLongPress,
             modifier = Modifier.padding(horizontal = 8.dp)

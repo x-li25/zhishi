@@ -2,6 +2,7 @@ package com.zhishi.schedule.data
 
 import android.Manifest
 import android.content.ContentUris
+import android.content.ContentProviderOperation
 import android.content.ContentValues
 import android.content.Context
 import android.content.pm.PackageManager
@@ -12,10 +13,52 @@ import com.zhishi.schedule.domain.ParsedActionType
 import com.zhishi.schedule.domain.ParsedEvent
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ensureActive
+import kotlin.coroutines.coroutineContext
 import java.time.LocalDate
 import java.time.ZoneId
 
 class CalendarRepository(private val context: Context) {
+
+    suspend fun campusImportedMarkers(): Set<String> = withContext(Dispatchers.IO) {
+        check(hasReadPermission()) { "请先授权日历读取权限" }
+        val result = mutableSetOf<String>()
+        val cursor = context.contentResolver.query(CalendarContract.Events.CONTENT_URI,
+            arrayOf(CalendarContract.Events.CUSTOM_APP_URI),
+            "${CalendarContract.Events.CUSTOM_APP_PACKAGE} = ? AND ${CalendarContract.Events.DELETED} = 0",
+            arrayOf(context.packageName), null) ?: error("无法核对已导入日程，请稍后重试")
+        cursor.use { while (it.moveToNext()) it.getString(0)?.let(result::add) }
+        result
+    }
+
+    /** Each chunk and its source markers commit together, so retry after failure cannot duplicate it. */
+    suspend fun importCampusEvents(events: List<CampusEvent>): Pair<Int, Int> = withContext(Dispatchers.IO) {
+        check(hasReadPermission() && hasWritePermission()) { "请先授权日历读取和写入权限" }
+        require(events.size <= 5000) { "一次导入项目过多，请缩小范围" }
+        val calendarId = firstWritableCalendarId() ?: error("手机中没有可写入的日历账户")
+        val existing = campusImportedMarkers()
+        val unique = events.distinctBy { it.key }
+        val pending = unique.filter { it.marker !in existing }
+        pending.chunked(40).forEach { chunk ->
+            coroutineContext.ensureActive()
+            val operations = ArrayList(chunk.map { event ->
+                require(event.endMillis > event.startMillis && event.title.isNotBlank()) { "日程内容无效" }
+                ContentProviderOperation.newInsert(CalendarContract.Events.CONTENT_URI)
+                    .withValue(CalendarContract.Events.CALENDAR_ID, calendarId)
+                    .withValue(CalendarContract.Events.TITLE, event.title)
+                    .withValue(CalendarContract.Events.DTSTART, event.startMillis)
+                    .withValue(CalendarContract.Events.DTEND, event.endMillis)
+                    .withValue(CalendarContract.Events.EVENT_TIMEZONE, CampusScheduleParser.zone.id)
+                    .withValue(CalendarContract.Events.EVENT_LOCATION, event.location)
+                    .withValue(CalendarContract.Events.HAS_ALARM, 0)
+                    .withValue(CalendarContract.Events.CUSTOM_APP_PACKAGE, context.packageName)
+                    .withValue(CalendarContract.Events.CUSTOM_APP_URI, event.marker)
+                    .build()
+            })
+            context.contentResolver.applyBatch(CalendarContract.AUTHORITY, operations)
+        }
+        pending.size to (unique.size - pending.size)
+    }
 
     fun hasReadPermission(): Boolean = hasPermission(Manifest.permission.READ_CALENDAR)
 
@@ -46,7 +89,8 @@ class CalendarRepository(private val context: Context) {
             CalendarContract.Instances.END,
             CalendarContract.Instances.ALL_DAY,
             CalendarContract.Instances.EVENT_LOCATION,
-            CalendarContract.Instances.RRULE
+            CalendarContract.Instances.RRULE,
+            CalendarContract.Instances.DESCRIPTION
         )
         val instancesUri = CalendarContract.Instances.CONTENT_URI.buildUpon()
             .appendPath(startOfDay.toString())
@@ -61,7 +105,8 @@ class CalendarRepository(private val context: Context) {
             val endMillis: Long,
             val allDay: Boolean,
             val location: String?,
-            val isRecurring: Boolean
+            val isRecurring: Boolean,
+            val description: String?
         )
 
         val raw = mutableListOf<RawEvent>()
@@ -80,6 +125,7 @@ class CalendarRepository(private val context: Context) {
             val allDayIndex = cursor.getColumnIndexOrThrow(CalendarContract.Instances.ALL_DAY)
             val locationIndex = cursor.getColumnIndexOrThrow(CalendarContract.Instances.EVENT_LOCATION)
             val rruleIndex = cursor.getColumnIndexOrThrow(CalendarContract.Instances.RRULE)
+            val descriptionIndex = cursor.getColumnIndexOrThrow(CalendarContract.Instances.DESCRIPTION)
 
             while (cursor.moveToNext()) {
                 val start = cursor.getLong(startIndex)
@@ -93,7 +139,8 @@ class CalendarRepository(private val context: Context) {
                     endMillis = end,
                     allDay = cursor.getInt(allDayIndex) == 1,
                     location = cursor.getString(locationIndex),
-                    isRecurring = !cursor.isNull(rruleIndex) && cursor.getString(rruleIndex).isNotBlank()
+                    isRecurring = !cursor.isNull(rruleIndex) && cursor.getString(rruleIndex).isNotBlank(),
+                    description = cursor.getString(descriptionIndex)
                 )
             }
         }
@@ -110,7 +157,8 @@ class CalendarRepository(private val context: Context) {
                 allDay = event.allDay,
                 location = event.location,
                 reminderMinutes = reminders[event.eventId].orEmpty(),
-                isRecurring = event.isRecurring
+                isRecurring = event.isRecurring,
+                description = event.description
             )
         }
     }
@@ -147,6 +195,7 @@ class CalendarRepository(private val context: Context) {
         zoneId: ZoneId = ZoneId.systemDefault()
     ): Long = withContext(Dispatchers.IO) {
         check(hasWritePermission()) { "没有日历写入权限" }
+        require(event.endMillis > event.startMillis) { "日程结束时间必须晚于开始时间" }
         val calendarId = firstWritableCalendarId() ?: error("手机中没有可写入的日历账户")
 
         val values = ContentValues().apply {
@@ -156,27 +205,31 @@ class CalendarRepository(private val context: Context) {
             put(CalendarContract.Events.DTEND, event.endMillis)
             put(CalendarContract.Events.EVENT_TIMEZONE, zoneId.id)
             put(CalendarContract.Events.EVENT_LOCATION, event.location)
-            put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.isEmpty()) 0 else 1)
+            put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.any { it >= 0 }) 1 else 0)
         }
-        val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
-            ?: error("写入系统日历失败")
-        val eventId = ContentUris.parseId(uri)
-
-        replaceReminders(eventId, event.reminderMinutes)
-        eventId
+        // CalendarProvider 将整批操作放入同一事务；提醒失败时事件也回滚。
+        val operations = arrayListOf(
+            ContentProviderOperation.newInsert(CalendarContract.Events.CONTENT_URI)
+                .withValues(values)
+                .build()
+        )
+        operations.addAll(reminderOperations(event.reminderMinutes))
+        val results = context.contentResolver.applyBatch(CalendarContract.AUTHORITY, operations)
+        ContentUris.parseId(results.first().uri ?: error("写入系统日历失败"))
     }
 
     suspend fun applyEvent(event: ParsedEvent, zoneId: ZoneId = ZoneId.systemDefault()) {
         when (event.action) {
             ParsedActionType.CREATE -> insertEvent(event, zoneId)
             ParsedActionType.UPDATE -> updateEvent(event, zoneId)
-            ParsedActionType.DELETE -> deleteEvent(event)
+            ParsedActionType.DELETE -> deleteEventById(event.targetEventId ?: error("缺少要删除的日程 ID"))
         }
     }
 
     suspend fun updateEvent(event: ParsedEvent, zoneId: ZoneId = ZoneId.systemDefault()) {
         withContext(Dispatchers.IO) {
             check(hasWritePermission()) { "没有日历写入权限" }
+            require(event.endMillis > event.startMillis) { "日程结束时间必须晚于开始时间" }
             val eventId = event.targetEventId ?: error("缺少要修改的日程 ID")
             ensureEditable(eventId)
             val values = ContentValues().apply {
@@ -185,21 +238,37 @@ class CalendarRepository(private val context: Context) {
                 put(CalendarContract.Events.DTEND, event.endMillis)
                 put(CalendarContract.Events.EVENT_TIMEZONE, zoneId.id)
                 put(CalendarContract.Events.EVENT_LOCATION, event.location)
-                put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.isEmpty()) 0 else 1)
+                put(CalendarContract.Events.HAS_ALARM, if (event.reminderMinutes.any { it >= 0 }) 1 else 0)
             }
             val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
-            if (context.contentResolver.update(uri, values, null, null) <= 0) {
-                error("日程不存在或已被其他应用修改")
-            }
-            replaceReminders(eventId, event.reminderMinutes)
+            val operations = arrayListOf(
+                ContentProviderOperation.newUpdate(uri)
+                    .withValues(values)
+                    .withExpectedCount(1)
+                    .build(),
+                ContentProviderOperation.newDelete(CalendarContract.Reminders.CONTENT_URI)
+                    .withSelection("${CalendarContract.Reminders.EVENT_ID} = ?", arrayOf(eventId.toString()))
+                    .build()
+            )
+            operations.addAll(reminderOperations(event.reminderMinutes, eventId))
+            context.contentResolver.applyBatch(CalendarContract.AUTHORITY, operations)
         }
     }
 
-    suspend fun deleteEvent(event: ParsedEvent) {
-        deleteEventById(event.targetEventId ?: error("缺少要删除的日程 ID"))
+    /** 详情弹窗只修改标题、地点，保留原时间、时区、提醒和其他日历字段。 */
+    suspend fun updateEventDetails(eventId: Long, title: String, location: String?) = withContext(Dispatchers.IO) {
+        require(title.isNotBlank()) { "日程标题不能为空" }
+        check(hasWritePermission()) { "没有日历写入权限，请到“今天”页授权" }
+        ensureEditable(eventId)
+        val values = ContentValues().apply {
+            put(CalendarContract.Events.TITLE, title.trim())
+            put(CalendarContract.Events.EVENT_LOCATION, location?.trim()?.takeIf { it.isNotEmpty() })
+        }
+        val uri = ContentUris.withAppendedId(CalendarContract.Events.CONTENT_URI, eventId)
+        check(context.contentResolver.update(uri, values, null, null) == 1) { "日程不存在或已被其他应用删除，请刷新后重试" }
     }
 
-    /** 手动删除入口：按事件 ID 删除，沿用全天/重复日程保护。 */
+    /** 删除入口：按事件 ID 删除，沿用全天/重复日程保护。 */
     suspend fun deleteEventById(eventId: Long) {
         withContext(Dispatchers.IO) {
             check(hasWritePermission()) { "没有日历写入权限" }
@@ -211,21 +280,21 @@ class CalendarRepository(private val context: Context) {
         }
     }
 
-    private fun replaceReminders(eventId: Long, minutes: List<Int>) {
-        context.contentResolver.delete(
-            CalendarContract.Reminders.CONTENT_URI,
-            "${CalendarContract.Reminders.EVENT_ID} = ?",
-            arrayOf(eventId.toString())
-        )
-        minutes.distinct().filter { it >= 0 }.forEach { minute ->
-            val reminder = ContentValues().apply {
-                put(CalendarContract.Reminders.EVENT_ID, eventId)
-                put(CalendarContract.Reminders.MINUTES, minute)
-                put(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_ALERT)
-            }
-            context.contentResolver.insert(CalendarContract.Reminders.CONTENT_URI, reminder)
+    /** 新建时提醒通过 back reference 关联本批第 0 项创建的事件。 */
+    private fun reminderOperations(minutes: List<Int>, eventId: Long? = null): List<ContentProviderOperation> =
+        minutes.distinct().filter { it >= 0 }.map { minute ->
+            ContentProviderOperation.newInsert(CalendarContract.Reminders.CONTENT_URI)
+                .withValue(CalendarContract.Reminders.MINUTES, minute)
+                .withValue(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_ALERT)
+                .apply {
+                    if (eventId == null) {
+                        withValueBackReference(CalendarContract.Reminders.EVENT_ID, 0)
+                    } else {
+                        withValue(CalendarContract.Reminders.EVENT_ID, eventId)
+                    }
+                }
+                .build()
         }
-    }
 
     /** 一次查询多个事件的提醒，按事件 ID 分组。 */
     private fun remindersForEvents(eventIds: List<Long>): Map<Long, List<Int>> {
@@ -289,4 +358,5 @@ class CalendarRepository(private val context: Context) {
         }
         return false
     }
+
 }

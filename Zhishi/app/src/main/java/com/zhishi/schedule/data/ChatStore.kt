@@ -2,6 +2,7 @@ package com.zhishi.schedule.data
 
 import android.content.Context
 import com.zhishi.schedule.domain.ChatMessage
+import com.zhishi.schedule.domain.ConversationMemory
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -11,6 +12,7 @@ import kotlinx.serialization.json.Json
  */
 class ChatStore(context: Context) {
     private val prefs = context.getSharedPreferences("zhishi_chat", Context.MODE_PRIVATE)
+    private val images = ChatImageStore(context)
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -22,17 +24,28 @@ class ChatStore(context: Context) {
             .getOrDefault(emptyList())
     }
 
-    fun save(messages: List<ChatMessage>) {
+    fun save(messages: List<ChatMessage>, retainedImageFileName: String? = null) {
+        val memory = memory().merge(messages.dropLast(ConversationMemory.RECENT_MESSAGES))
         val trimmed = messages.takeLast(MAX_MESSAGES)
-        prefs.edit().putString(KEY_MESSAGES, json.encodeToString(trimmed)).apply()
+        val retained = trimmed.mapNotNull { it.imageFileName }.toSet() + listOfNotNull(retainedImageFileName)
+        val removed = load().mapNotNull { it.imageFileName }.toSet() - retained
+        prefs.edit().putString(KEY_MESSAGES, json.encodeToString(trimmed))
+            .putString(KEY_MEMORY, json.encodeToString(memory)).apply()
+        removed.forEach(images::delete)
     }
 
     fun clear() {
-        prefs.edit().remove(KEY_MESSAGES).apply()
+        prefs.edit().remove(KEY_MESSAGES).remove(KEY_MEMORY).apply()
+        images.retainOnly(emptySet())
     }
+
+    fun memory(): ConversationMemory = prefs.getString(KEY_MEMORY, null)?.let {
+        runCatching { json.decodeFromString<ConversationMemory>(it) }.getOrNull()
+    } ?: ConversationMemory()
 
     companion object {
         private const val KEY_MESSAGES = "messages"
+        private const val KEY_MEMORY = "memory_v1"
         private const val MAX_MESSAGES = 100
     }
 }

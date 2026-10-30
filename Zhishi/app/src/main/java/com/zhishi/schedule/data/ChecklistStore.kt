@@ -3,6 +3,7 @@ package com.zhishi.schedule.data
 import android.content.Context
 import com.zhishi.schedule.domain.CalendarEvent
 import com.zhishi.schedule.domain.ChecklistItem
+import com.zhishi.schedule.domain.ChecklistKeys
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -12,6 +13,10 @@ import kotlinx.serialization.json.Json
  */
 class ChecklistStore(context: Context) {
     private val prefs = context.getSharedPreferences("zhishi_checklists", Context.MODE_PRIVATE)
+    init {
+        // 清理旧版评分数据，清单及勾选状态继续沿用。
+        if (prefs.contains("ratings")) prefs.edit().remove("ratings").apply()
+    }
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
@@ -39,48 +44,50 @@ class ChecklistStore(context: Context) {
         saveItems(current)
     }
 
-    /** 自我打分：1~5 星，按事件实例存储。 */
-    fun loadRatings(): Map<String, Int> {
-        val raw = prefs.getString(KEY_RATINGS, null) ?: return emptyMap()
-        return runCatching {
-            json.decodeFromString<Map<String, Int>>(raw)
-        }.getOrDefault(emptyMap())
+    fun addItem(key: String, text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        val current = load().toMutableMap()
+        current[key] = current[key].orEmpty() + ChecklistItem(trimmed)
+        saveItems(current)
     }
 
-    fun setRating(key: String, stars: Int) {
-        require(stars in 1..5) { "评分必须是 1 到 5 星" }
-        saveRatings(loadRatings() + (key to stars))
+    fun removeItem(key: String, index: Int) {
+        val current = load().toMutableMap()
+        val items = current[key]?.toMutableList() ?: return
+        if (index !in items.indices) return
+        items.removeAt(index)
+        if (items.isEmpty()) current.remove(key) else current[key] = items
+        saveItems(current)
     }
 
     fun remove(key: String) {
         val items = load().toMutableMap()
-        val ratings = loadRatings().toMutableMap()
-        val changed = items.remove(key) != null || ratings.remove(key) != null
-        if (changed) {
-            saveItems(items)
-            saveRatings(ratings)
-        }
+        items.remove(key)
+        saveItems(items)
     }
 
-    /** 删除事件时清理它的所有实例清单与评分。 */
+    /** 迁移清单，重复迁移不会覆盖已迁移的数据。 */
+    fun move(oldKey: String, newKey: String) {
+        if (oldKey == newKey) return
+        val items = load().toMutableMap()
+        items.remove(oldKey)?.let { items[newKey] = it }
+        saveItems(items)
+    }
+
+    /** 删除事件时清理它的所有实例清单。 */
     fun removeByEventId(eventId: Long) {
         val prefix = "$eventId:"
         saveItems(load().filterKeys { !it.startsWith(prefix) })
-        saveRatings(loadRatings().filterKeys { !it.startsWith(prefix) })
     }
 
     private fun saveItems(map: Map<String, List<ChecklistItem>>) {
         prefs.edit().putString(KEY_ITEMS, json.encodeToString(map)).apply()
     }
 
-    private fun saveRatings(map: Map<String, Int>) {
-        prefs.edit().putString(KEY_RATINGS, json.encodeToString(map)).apply()
-    }
-
     companion object {
         private const val KEY_ITEMS = "items"
-        private const val KEY_RATINGS = "ratings"
-        fun keyOf(event: CalendarEvent): String = "${event.eventId}:${event.startMillis}"
-        fun keyOf(eventId: Long, startMillis: Long): String = "$eventId:$startMillis"
+        fun keyOf(event: CalendarEvent): String = ChecklistKeys.of(event)
+        fun keyOf(eventId: Long, startMillis: Long): String = ChecklistKeys.of(eventId, startMillis)
     }
 }

@@ -1,28 +1,47 @@
 package com.zhishi.schedule.ui.screens
 
 import android.app.Application
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.net.Uri
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.zhishi.schedule.ai.GlmClient
 import com.zhishi.schedule.data.CalendarRepository
 import com.zhishi.schedule.data.ChatStore
+import com.zhishi.schedule.data.ChatImageStore
 import com.zhishi.schedule.data.ChecklistStore
 import com.zhishi.schedule.data.ConfigStore
+import com.zhishi.schedule.data.WeatherStore
+import com.zhishi.schedule.data.WeatherClient
+import com.zhishi.schedule.data.HomeworkClient
+import com.zhishi.schedule.data.HomeworkPriorityStore
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import com.zhishi.schedule.domain.AcademicCalendar
 import com.zhishi.schedule.domain.CalendarEvent
 import com.zhishi.schedule.domain.ChatMessage
 import com.zhishi.schedule.domain.ChatRole
 import com.zhishi.schedule.domain.ChecklistItem
 import com.zhishi.schedule.domain.DaySchedule
 import com.zhishi.schedule.domain.GlmConfig
+import com.zhishi.schedule.domain.ModelCatalogState
 import com.zhishi.schedule.domain.ParsedActionType
 import com.zhishi.schedule.domain.ParsedEvent
 import com.zhishi.schedule.domain.ScheduleEngine
-import com.zhishi.schedule.domain.SchedulePreferences
-import com.zhishi.schedule.util.AppDateFormat
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import java.time.DayOfWeek
 import java.time.Instant
 import java.time.LocalDate
@@ -35,40 +54,67 @@ data class AppUiState(
     val weekStart: LocalDate = LocalDate.now().with(TemporalAdjusters.previousOrSame(DayOfWeek.MONDAY)),
     val weekDays: List<DaySchedule> = emptyList(),
     val loading: Boolean = false,
+    val dayError: String? = null,
     val error: String? = null,
     val notice: String? = null,
     val calendarPermissionGranted: Boolean = false,
     val textInput: String = "",
+    val selectedImageFileName: String? = null,
+    val preparingImage: Boolean = false,
+    val parsingLabel: String = "正在思考…",
     val messages: List<ChatMessage> = emptyList(),
     val parsing: Boolean = false,
+    val canStopGeneration: Boolean = false,
     val glmConfig: GlmConfig = GlmConfig(),
-    val preferences: SchedulePreferences = SchedulePreferences(),
     val testingConnection: Boolean = false,
+    val connectionResult: String? = null,
+    val modelCatalog: ModelCatalogState = ModelCatalogState(),
     val checklists: Map<String, List<ChecklistItem>> = emptyMap(),
-    val ratings: Map<String, Int> = emptyMap(),
     val detailEvent: CalendarEvent? = null,
-    val pendingDeleteEvent: CalendarEvent? = null
+    val weekDetailEvent: CalendarEvent? = null,
+    val savingEventDetails: Boolean = false,
+    val eventDetailsError: String? = null,
+    val pendingDeleteEvent: CalendarEvent? = null,
+    val knownEvents: List<CalendarEvent> = emptyList(),
+    val notificationPermissionGranted: Boolean = true
 )
 
-class AppViewModel(application: Application) : AndroidViewModel(application) {
+class AppViewModel @JvmOverloads constructor(
+    application: Application,
+    private val glmClient: GlmClient = GlmClient(),
+    private val dayReader: suspend (LocalDate) -> List<CalendarEvent> = { CalendarRepository(application).eventsForDate(it) }
+) : AndroidViewModel(application) {
     private val calendarRepository = CalendarRepository(application)
     private val configStore = ConfigStore(application)
     private val checklistStore = ChecklistStore(application)
     private val chatStore = ChatStore(application)
-    private val glmClient = GlmClient()
+    private val imageStore = ChatImageStore(application)
+    private val weatherStore = WeatherStore(application)
+    private val weatherClient = WeatherClient()
     private val scheduleEngine = ScheduleEngine()
 
     private var messageCounter = 0L
+    private var modelsRequestId = 0L
+    private var modelsJob: Job? = null
+    private var dayJob: Job? = null
+    private var dayRequest = 0L
+    private data class GenerationDraft(
+        val messageId: Long,
+        val text: String,
+        val imageFileName: String?,
+        val previousKnownEvents: List<CalendarEvent>
+    )
+    @Volatile private var activeGenerationId: Long? = null
+    private var generationJob: Job? = null
+    private var generationDraft: GenerationDraft? = null
 
     private val initialConfig = loadConfigSafely()
 
     private val _state = MutableStateFlow(
         AppUiState(
             glmConfig = initialConfig.first,
-            preferences = configStore.loadSchedulePreferences(),
             calendarPermissionGranted = calendarRepository.hasReadPermission(),
             checklists = checklistStore.load(),
-            ratings = checklistStore.loadRatings(),
             messages = chatStore.load(),
             error = initialConfig.second
         )
@@ -76,8 +122,23 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     val state: StateFlow<AppUiState> = _state.asStateFlow()
 
     init {
+        imageStore.retainOnly(_state.value.messages.mapNotNull { it.imageFileName }.toSet())
+        refreshNotificationPermission()
         refreshDay()
         refreshWeek()
+    }
+
+    /** 提醒通知权限（API 33 以下默认开启）。 */
+    fun refreshNotificationPermission() {
+        val app = getApplication<Application>()
+        val granted = if (Build.VERSION.SDK_INT >= 33) {
+            ContextCompat.checkSelfPermission(
+                app, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        _state.value = _state.value.copy(notificationPermissionGranted = granted)
     }
 
     fun refreshCalendarPermission() {
@@ -90,48 +151,46 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshDay() {
         val current = _state.value
-        _state.value = current.copy(loading = true, error = null)
-        viewModelScope.launch {
-            runCatching {
-                val events = calendarRepository.eventsForDate(current.selectedDate)
-                scheduleEngine.buildDay(
+        val token = ++dayRequest
+        dayJob?.cancel()
+        _state.value = current.copy(loading = true, dayError = null)
+        dayJob = viewModelScope.launch {
+            try {
+                val events = dayReader(current.selectedDate)
+                val day = scheduleEngine.buildDay(
                     date = current.selectedDate,
                     zoneId = ZoneId.systemDefault(),
-                    events = events,
-                    preferences = current.preferences
+                    events = events
                 )
-            }.onSuccess { day ->
-                _state.value = _state.value.copy(daySchedule = day, loading = false, error = null)
-            }.onFailure { error ->
-                _state.value = _state.value.copy(
-                    loading = false,
-                    error = error.message ?: "读取日程失败"
-                )
+                ensureActive()
+                if (token == dayRequest && _state.value.selectedDate == current.selectedDate) {
+                    _state.value = _state.value.copy(daySchedule = day, loading = false, dayError = null)
+                }
+            } catch (e: CancellationException) { throw e }
+            catch (_: Exception) {
+                if (token == dayRequest && _state.value.selectedDate == current.selectedDate)
+                    _state.value = _state.value.copy(loading = false, dayError = "暂时无法读取日程，请检查日历权限后重试。")
             }
         }
     }
 
     fun selectDate(date: LocalDate) {
-        _state.value = _state.value.copy(selectedDate = date)
+        _state.value = _state.value.copy(selectedDate = date, daySchedule = _state.value.daySchedule?.takeIf { it.date == date })
         refreshDay()
     }
 
     fun refreshWeek() {
         val weekStart = _state.value.weekStart
-        val preferences = _state.value.preferences
         viewModelScope.launch {
             runCatching {
                 val zoneId = ZoneId.systemDefault()
                 val events = calendarRepository.eventsForRange(weekStart, weekStart.plusDays(6), zoneId)
-                val byDay = events.groupBy {
-                    Instant.ofEpochMilli(it.startMillis).atZone(zoneId).toLocalDate()
-                }
-                (0L..6L).map { offset ->
-                    val date = weekStart.plusDays(offset)
-                    scheduleEngine.buildDay(date, zoneId, byDay[date].orEmpty(), preferences)
-                }
+                scheduleEngine.buildDays(weekStart, weekStart.plusDays(6), zoneId, events)
             }.onSuccess { days ->
-                _state.value = _state.value.copy(weekDays = days)
+                // 同 refreshDay：快速翻周时丢弃过期的结果
+                if (_state.value.weekStart == weekStart) {
+                    _state.value = _state.value.copy(weekDays = days)
+                }
             }.onFailure { error ->
                 _state.value = _state.value.copy(error = error.message ?: "读取本周日程失败")
             }
@@ -161,6 +220,45 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(detailEvent = null)
     }
 
+    /** 周视图的全部日程都能查看详情，不受是否有清单限制。 */
+    fun openWeekEventDetail(event: CalendarEvent) {
+        if (_state.value.savingEventDetails) return
+        _state.value = _state.value.copy(weekDetailEvent = event, eventDetailsError = null)
+    }
+
+    fun closeWeekEventDetail() {
+        if (_state.value.savingEventDetails) return
+        _state.value = _state.value.copy(weekDetailEvent = null, eventDetailsError = null)
+    }
+
+    fun saveWeekEventDetails(title: String, location: String) {
+        val event = _state.value.weekDetailEvent ?: return
+        if (_state.value.savingEventDetails) return
+        _state.value = _state.value.copy(savingEventDetails = true, eventDetailsError = null)
+        viewModelScope.launch {
+            runCatching { calendarRepository.updateEventDetails(event.eventId, title, location) }
+                .onSuccess {
+                    fun CalendarEvent.updatedDetails() = if (eventId == event.eventId) {
+                        copy(title = title.trim(), location = location.trim().takeIf { it.isNotEmpty() })
+                    } else this
+                    _state.value = _state.value.copy(
+                        weekDetailEvent = null,
+                        savingEventDetails = false,
+                        detailEvent = _state.value.detailEvent?.updatedDetails(),
+                        knownEvents = _state.value.knownEvents.map { it.updatedDetails() },
+                        notice = "日程已保存"
+                    )
+                    refreshDay()
+                    refreshWeek()
+                }.onFailure { failure ->
+                    _state.value = _state.value.copy(
+                        savingEventDetails = false,
+                        eventDetailsError = failure.message ?: "保存失败，请重试"
+                    )
+                }
+        }
+    }
+
     fun checklistOf(event: CalendarEvent): List<ChecklistItem> =
         _state.value.checklists[ChecklistStore.keyOf(event)].orEmpty()
 
@@ -169,15 +267,15 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         reloadChecklists()
     }
 
-    /** 清单全部完成后给自己打分（1~5 星）。 */
-    fun rateEvent(event: CalendarEvent, stars: Int) {
-        runCatching { checklistStore.setRating(ChecklistStore.keyOf(event), stars) }
-            .onSuccess { reloadChecklists() }
-            .onFailure { _state.value = _state.value.copy(error = it.message) }
+    fun addChecklistItem(event: CalendarEvent, text: String) {
+        checklistStore.addItem(ChecklistStore.keyOf(event), text)
+        reloadChecklists()
     }
 
-    fun ratingOf(event: CalendarEvent): Int? =
-        _state.value.ratings[ChecklistStore.keyOf(event)]
+    fun removeChecklistItem(event: CalendarEvent, index: Int) {
+        checklistStore.removeItem(ChecklistStore.keyOf(event), index)
+        reloadChecklists()
+    }
 
     /** 长按日程请求删除：全天/重复日程受保护，直接提示。 */
     fun requestDeleteEvent(event: CalendarEvent) {
@@ -221,8 +319,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun reloadChecklists() {
         _state.value = _state.value.copy(
-            checklists = checklistStore.load(),
-            ratings = checklistStore.loadRatings()
+            checklists = checklistStore.load()
         )
     }
 
@@ -230,36 +327,111 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(textInput = value)
     }
 
+    fun selectImage(uri: Uri) {
+        if (_state.value.parsing || _state.value.preparingImage) return
+        _state.value = _state.value.copy(preparingImage = true, error = null)
+        viewModelScope.launch {
+            runCatching { imageStore.importImage(uri) }
+                .onSuccess { name ->
+                    _state.value.selectedImageFileName?.let(imageStore::delete)
+                    _state.value = _state.value.copy(selectedImageFileName = name, preparingImage = false)
+                }
+                .onFailure { failure ->
+                    _state.value = _state.value.copy(preparingImage = false, error = failure.message ?: "读取图片失败，请重新选择")
+                }
+        }
+    }
+
+    fun removeSelectedImage() {
+        if (_state.value.parsing || _state.value.preparingImage) return
+        _state.value.selectedImageFileName?.let(imageStore::delete)
+        _state.value = _state.value.copy(selectedImageFileName = null)
+    }
+
+    private fun persistMessages(messages: List<ChatMessage>) {
+        chatStore.save(messages, retainedImageFileName = _state.value.selectedImageFileName)
+    }
+
     /** 发送一条聊天消息，AI 带着最近对话历史（记忆）回复。 */
     fun sendChatMessage() {
         val current = _state.value
-        val text = current.textInput.trim()
-        if (text.isBlank() || current.parsing) return
+        val image = current.selectedImageFileName
+        val text = current.textInput.trim().ifBlank { if (image != null) "请识别这张图片中的日程，帮我安排。" else "" }
+        if (text.isBlank() || current.parsing || current.preparingImage) return
         val userMessage = ChatMessage(
             id = nextMessageId(),
             role = ChatRole.USER,
             text = text,
-            timestamp = System.currentTimeMillis()
+            timestamp = System.currentTimeMillis(),
+            imageFileName = image
         )
         val baseMessages = current.messages + userMessage
+        val draft = GenerationDraft(userMessage.id, current.textInput, image, current.knownEvents)
+        generationDraft = draft
+        activeGenerationId = userMessage.id
         _state.value = current.copy(
             messages = baseMessages,
             textInput = "",
+            selectedImageFileName = null,
             parsing = true,
-            error = null
+            canStopGeneration = true,
+            knownEvents = emptyList(),
+            parsingLabel = if (image == null) "正在思考…" else "正在本机提取图片文字…",
+            error = null,
+            notice = null
         )
-        chatStore.save(baseMessages)
-        viewModelScope.launch {
-            runCatching {
-                val today = LocalDate.now()
-                val events = calendarRepository.eventsForRange(today.minusDays(7), today.plusDays(30))
-                glmClient.chat(
+        persistMessages(baseMessages)
+        val job = viewModelScope.launch(start = CoroutineStart.LAZY) {
+            try {
+                val imageText = image?.let { name ->
+                    try {
+                        withTimeoutOrNull(8_000) { imageStore.recognizeText(name) }
+                            ?.takeIf { it.length <= 30_000 }.orEmpty()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // 识别失败或无文字时自动回退一次原图理解，草稿仍可失败重试。
+                        ""
+                    }
+                }
+                val now = Instant.now()
+                currentCoroutineContext().ensureActive()
+                val zoneId = ZoneId.systemDefault()
+                val canRead = calendarRepository.hasReadPermission()
+                val queriedEvents = linkedMapOf<String, CalendarEvent>()
+                val weatherLocation = weatherStore.location()
+                val result = glmClient.chat(
                     history = baseMessages,
                     config = current.glmConfig,
-                    existingEvents = events,
-                    scheduleContext = buildScheduleContext(current.daySchedule)
+                    now = now,
+                    zoneId = zoneId,
+                    weatherLocation = weatherLocation,
+                    readWeather = weatherLocation?.let { location ->
+                        { start, end -> weatherClient.forecast(location, start, end, zoneId) }
+                    },
+                    scheduleContext = buildScheduleContext(current),
+                    memory = chatStore.memory(),
+                    readHomework = { query ->
+                        val school = withContext(Dispatchers.Main.immediate) { HomeworkClient.forAndroid(getApplication()) }
+                        HomeworkPriorityStore(getApplication()).decorate(school.read(query))
+                    },
+                    imageText = imageText,
+                    loadImageDataUrl = image?.let { name -> suspend { imageStore.dataUrl(name) } },
+                    onProgress = { label ->
+                        updateGenerationState(userMessage.id) { it.copy(parsingLabel = label) }
+                    },
+                    readCalendar = if (!canRead) null else { start, end ->
+                        currentCoroutineContext().ensureActive()
+                        check(calendarRepository.hasReadPermission()) { "请先授予日历读取权限" }
+                        calendarRepository.eventsForRange(start, end, zoneId).also { events ->
+                            currentCoroutineContext().ensureActive()
+                            events.forEach { queriedEvents[ChecklistStore.keyOf(it)] = it }
+                            updateGenerationState(userMessage.id) { it.copy(knownEvents = queriedEvents.values.toList()) }
+                        }
+                    }
                 )
-            }.onSuccess { result ->
+                currentCoroutineContext().ensureActive()
+                if (!finishGeneration(userMessage.id)) return@launch
                 val reply = buildString {
                     append(result.summary)
                     result.questions.forEach { append("\n• ").append(it) }
@@ -270,23 +442,74 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     text = reply,
                     timestamp = System.currentTimeMillis(),
                     actions = result.events,
-                    warnings = result.warnings
+                    warnings = result.warnings,
+                    tokenUsage = result.totalTokens
                 )
-                val updated = _state.value.messages + assistantMessage
-                _state.value = _state.value.copy(messages = updated, parsing = false)
-                chatStore.save(updated)
-            }.onFailure { error ->
-                _state.value = _state.value.copy(
-                    parsing = false,
-                    error = error.message ?: "AI 回复失败"
-                )
+                val updated = _state.value.messages.map { message ->
+                    if (message.id == userMessage.id && image != null) message.copy(
+                        imageAnalysis = result.imageAnalysis,
+                        imageText = result.imageText
+                    )
+                    else message
+                } + assistantMessage
+                _state.value = _state.value.copy(messages = updated, parsing = false, canStopGeneration = false)
+                persistMessages(updated)
+            } catch (cancelled: CancellationException) {
+                if (finishGeneration(userMessage.id)) restoreGenerationDraft(draft, notice = "已停止生成")
+                throw cancelled
+            } catch (failure: Exception) {
+                if (finishGeneration(userMessage.id)) {
+                    restoreGenerationDraft(draft, error = failure.message ?: "AI 回复失败")
+                }
             }
+        }
+        generationJob = job
+        job.start()
+    }
+
+    /** 先使本次请求失效再取消，迟到的进度/日历/网络结果不能覆盖新对话。 */
+    fun stopGeneration() {
+        val draft = generationDraft ?: return
+        val job = generationJob
+        if (!finishGeneration(draft.messageId)) return
+        job?.cancel()
+        restoreGenerationDraft(draft, notice = "已停止生成")
+    }
+
+    private fun finishGeneration(messageId: Long): Boolean {
+        if (activeGenerationId != messageId) return false
+        activeGenerationId = null
+        generationJob = null
+        generationDraft = null
+        return true
+    }
+
+    private fun updateGenerationState(messageId: Long, transform: (AppUiState) -> AppUiState) {
+        _state.update { current ->
+            if (activeGenerationId == messageId && current.canStopGeneration) transform(current) else current
         }
     }
 
+    private fun restoreGenerationDraft(draft: GenerationDraft, notice: String? = null, error: String? = null) {
+        val restored = _state.value.messages.filterNot { it.id == draft.messageId }
+        _state.value = _state.value.copy(
+            messages = restored,
+            textInput = draft.text,
+            selectedImageFileName = draft.imageFileName,
+            knownEvents = draft.previousKnownEvents,
+            parsing = false,
+            canStopGeneration = false,
+            parsingLabel = "正在思考…",
+            notice = notice,
+            error = error
+        )
+        persistMessages(restored)
+    }
+
     fun clearChat() {
+        if (_state.value.parsing || _state.value.preparingImage) return
         chatStore.clear()
-        _state.value = _state.value.copy(messages = emptyList(), notice = "对话已清空")
+        _state.value = _state.value.copy(messages = emptyList(), textInput = "", selectedImageFileName = null, notice = "对话已清空")
     }
 
     /**
@@ -296,7 +519,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     fun confirmMessageActions(messageId: Long) {
         val message = _state.value.messages.firstOrNull { it.id == messageId } ?: return
         if (message.actions.isEmpty() || _state.value.parsing) return
-        _state.value = _state.value.copy(parsing = true, error = null)
+        _state.value = _state.value.copy(parsing = true, canStopGeneration = false, parsingLabel = "正在写入日程…", error = null)
         viewModelScope.launch {
             val remaining = mutableListOf<ParsedEvent>()
             val failures = mutableListOf<String>()
@@ -317,18 +540,14 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                             val oldStart = event.originalStartMillis
                             if (targetId != null && oldStart != null && oldStart != event.startMillis) {
                                 val oldKey = ChecklistStore.keyOf(targetId, oldStart)
-                                val oldItems = checklistStore.load()[oldKey]
-                                checklistStore.remove(oldKey)
-                                if (event.checklist.isEmpty() && !oldItems.isNullOrEmpty()) {
-                                    checklistStore.setItems(
-                                        ChecklistStore.keyOf(targetId, event.startMillis), oldItems
-                                    )
-                                }
+                                checklistStore.move(oldKey, ChecklistStore.keyOf(targetId, event.startMillis))
                             }
                             targetId?.let { ChecklistStore.keyOf(it, event.startMillis) }
                         }
                         ParsedActionType.DELETE -> {
-                            calendarRepository.deleteEvent(event)
+                            calendarRepository.deleteEventById(
+                                event.targetEventId ?: error("缺少要删除的日程 ID")
+                            )
                             event.targetEventId?.let { checklistStore.removeByEventId(it) }
                             null
                         }
@@ -367,7 +586,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 )
             }
-            chatStore.save(updated)
+            persistMessages(updated)
             if (succeeded > 0) {
                 reloadChecklists()
                 refreshDay()
@@ -395,7 +614,7 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
             if (it.id == messageId) transform(it) else it
         }
         _state.value = _state.value.copy(messages = updated)
-        chatStore.save(updated)
+        persistMessages(updated)
     }
 
     private fun nextMessageId(): Long =
@@ -413,21 +632,50 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun testGlmConnection(config: GlmConfig) {
-        _state.value = _state.value.copy(testingConnection = true, error = null, notice = null)
+        _state.value = _state.value.copy(testingConnection = true, connectionResult = null, error = null, notice = null)
         viewModelScope.launch {
             runCatching { glmClient.testConnection(config) }
                 .onSuccess {
                     _state.value = _state.value.copy(
                         testingConnection = false,
-                        notice = "连接成功：${it}"
+                        notice = "连接成功：${it}", connectionResult = "连接成功：${it}"
                     )
                 }
                 .onFailure {
                     _state.value = _state.value.copy(
                         testingConnection = false,
-                        error = it.message ?: "连接失败"
+                        error = it.message ?: "连接失败", connectionResult = it.message ?: "连接失败"
                     )
                 }
+        }
+    }
+
+    fun invalidateModelCatalog() {
+        modelsRequestId++
+        modelsJob?.cancel()
+        modelsJob = null
+        _state.value = _state.value.copy(modelCatalog = ModelCatalogState(), connectionResult = null)
+    }
+
+    fun fetchModels(config: GlmConfig) {
+        invalidateModelCatalog()
+        val requestId = modelsRequestId
+        _state.value = _state.value.copy(modelCatalog = ModelCatalogState(loading = true))
+        modelsJob = viewModelScope.launch {
+            try {
+                val models = glmClient.listModels(config)
+                if (requestId == modelsRequestId) {
+                    _state.value = _state.value.copy(modelCatalog = ModelCatalogState(models = models, loaded = true))
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                if (requestId == modelsRequestId) {
+                    _state.value = _state.value.copy(modelCatalog = ModelCatalogState(
+                        error = failure.message ?: "获取模型列表失败，请重试或手动填写模型名称"
+                    ))
+                }
+            }
         }
     }
 
@@ -435,14 +683,10 @@ class AppViewModel(application: Application) : AndroidViewModel(application) {
         _state.value = _state.value.copy(error = null, notice = null)
     }
 
-    private fun buildScheduleContext(day: DaySchedule?): String {
-        if (day == null) return ""
-        val free = day.freeRanges
-            .filter { it.durationMinutes >= 20 }
-            .take(8)
-            .joinToString("；") { AppDateFormat.timeRange(it.startMillis, it.endMillis, day.zoneId) }
-            .ifBlank { "无" }
-        return "查看日期=${day.date}；当天空闲=$free"
+    private fun buildScheduleContext(current: AppUiState): String {
+        // 页面日期仅用于理解“当前这天/这一周”，实际日程按需读取。
+        return "页面查看日期=${current.selectedDate}（${AcademicCalendar.label(current.selectedDate)}）；" +
+            "页面查看周=${current.weekStart}至${current.weekStart.plusDays(6)}（${AcademicCalendar.label(current.weekStart)}）。"
     }
 
     fun reportError(message: String?) {

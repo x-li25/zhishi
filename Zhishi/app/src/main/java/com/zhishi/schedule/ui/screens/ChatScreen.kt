@@ -1,5 +1,10 @@
 package com.zhishi.schedule.ui.screens
 
+import android.graphics.Bitmap
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -11,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.sizeIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -23,6 +29,8 @@ import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.Save
 import androidx.compose.material.icons.outlined.SmartToy
+import androidx.compose.material.icons.outlined.AddPhotoAlternate
+import androidx.compose.material.icons.outlined.StopCircle
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -40,11 +48,16 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.zhishi.schedule.domain.CalendarEvent
+import com.zhishi.schedule.data.ChatImageStore
 import com.zhishi.schedule.domain.ChatMessage
 import com.zhishi.schedule.domain.ChatRole
 import com.zhishi.schedule.domain.ParsedActionType
@@ -59,7 +72,10 @@ import java.time.format.DateTimeFormatter
 fun ChatScreen(
     state: AppUiState,
     onTextChange: (String) -> Unit,
+    onSelectImage: (Uri) -> Unit,
+    onRemoveImage: () -> Unit,
     onSend: () -> Unit,
+    onStopGeneration: () -> Unit,
     onClearChat: () -> Unit,
     onConfirmMessage: (Long) -> Unit,
     onRemoveAction: (Long, Int) -> Unit,
@@ -69,11 +85,15 @@ fun ChatScreen(
     val editingEvent = editingTarget?.let { (messageId, index) ->
         state.messages.firstOrNull { it.id == messageId }?.actions?.getOrNull(index)
     }
-    val listState = rememberLazyListState()
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = state.messages.lastIndex.coerceAtLeast(0))
+    val imagePicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        uri?.let(onSelectImage)
+    }
+    val busy = state.parsing || state.preparingImage
 
     LaunchedEffect(state.messages.size, state.parsing) {
         if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.lastIndex)
+            listState.scrollToItem(state.messages.lastIndex)
         }
     }
 
@@ -102,7 +122,7 @@ fun ChatScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            IconButton(onClick = onClearChat, enabled = state.messages.isNotEmpty()) {
+            IconButton(onClick = onClearChat, enabled = (state.messages.isNotEmpty() || state.selectedImageFileName != null) && !busy) {
                 Icon(Icons.Outlined.DeleteSweep, contentDescription = "清空对话")
             }
         }
@@ -130,6 +150,8 @@ fun ChatScreen(
                             Text("• 把周五的复习数学挪到晚上八点", style = MaterialTheme.typography.bodyMedium)
                             Text("• 取消后天早上的例会", style = MaterialTheme.typography.bodyMedium)
                             Text("• 我这周哪天下午有空？", style = MaterialTheme.typography.bodyMedium)
+                            Text("• 发图片后先识别文字，文字不足时再看原图安排日程", style = MaterialTheme.typography.bodyMedium)
+                            Text("• 结合天气安排户外活动，例如“明天帮我选个适合跑步的时间”", style = MaterialTheme.typography.bodyMedium)
                         }
                     }
                 }
@@ -138,6 +160,7 @@ fun ChatScreen(
                 ChatBubble(
                     message = message,
                     parsing = state.parsing,
+                    knownEvents = state.knownEvents,
                     onConfirm = { onConfirmMessage(message.id) },
                     onEditAction = { index -> editingTarget = message.id to index },
                     onRemoveAction = { index -> onRemoveAction(message.id, index) }
@@ -150,47 +173,80 @@ fun ChatScreen(
                             color = MaterialTheme.colorScheme.surfaceVariant,
                             shape = RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp)
                         ) {
-                            Text(
-                                text = "正在思考…",
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = state.parsingLabel,
+                                    modifier = Modifier.weight(1f).padding(horizontal = 14.dp, vertical = 10.dp),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                if (state.canStopGeneration) {
+                                    TextButton(onClick = onStopGeneration) { Text("停止生成") }
+                                }
+                            }
                         }
                     }
                 }
             }
         }
 
-        Row(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 // 清单文件里是 adjustNothing：窗口不随键盘缩放，
                 // 输入框只由这一处 imePadding 抬到键盘上方，避免双重抬升
                 .imePadding()
                 .padding(horizontal = 16.dp, vertical = 10.dp),
-            verticalAlignment = Alignment.CenterVertically
         ) {
-            OutlinedTextField(
-                value = state.textInput,
-                onValueChange = onTextChange,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("告诉我你的安排…") },
-                maxLines = 4
-            )
-            IconButton(
-                onClick = onSend,
-                enabled = state.textInput.isNotBlank() && !state.parsing
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Outlined.Send,
-                    contentDescription = "发送",
-                    tint = if (state.textInput.isNotBlank() && !state.parsing) {
-                        MaterialTheme.colorScheme.primary
-                    } else {
-                        MaterialTheme.colorScheme.outline
+            if (state.preparingImage) {
+                Text("正在准备图片…", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.height(6.dp))
+            }
+            state.selectedImageFileName?.let { name ->
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            ChatImagePreview(name)
+                            Spacer(Modifier.height(4.dp))
+                            Text("优先提取文字安排日程，也可补充“只安排周五”等要求", style = MaterialTheme.typography.bodySmall)
+                        }
+                        IconButton(onClick = onRemoveImage, enabled = !busy) {
+                            Icon(Icons.Outlined.Close, contentDescription = "移除所选图片")
+                        }
                     }
+                }
+                Spacer(Modifier.height(8.dp))
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconButton(onClick = { imagePicker.launch("image/*") }, enabled = !busy) {
+                    Icon(Icons.Outlined.AddPhotoAlternate, contentDescription = "选择日程图片")
+                }
+                OutlinedTextField(
+                    value = state.textInput,
+                    onValueChange = onTextChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text(if (state.selectedImageFileName == null) "告诉我你的安排…" else "补充安排要求（可选）…") },
+                    enabled = !busy,
+                    maxLines = 4
                 )
+                IconButton(
+                    onClick = if (state.canStopGeneration) onStopGeneration else onSend,
+                    enabled = state.canStopGeneration || ((state.textInput.isNotBlank() || state.selectedImageFileName != null) && !busy)
+                ) {
+                    Icon(
+                        if (state.canStopGeneration) Icons.Outlined.StopCircle else Icons.AutoMirrored.Outlined.Send,
+                        contentDescription = if (state.canStopGeneration) "停止生成" else "发送",
+                        tint = if (state.canStopGeneration || ((state.textInput.isNotBlank() || state.selectedImageFileName != null) && !busy)) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.outline
+                        }
+                    )
+                }
             }
         }
     }
@@ -211,11 +267,14 @@ fun ChatScreen(
 private fun ChatBubble(
     message: ChatMessage,
     parsing: Boolean,
+    knownEvents: List<CalendarEvent>,
     onConfirm: () -> Unit,
     onEditAction: (Int) -> Unit,
     onRemoveAction: (Int) -> Unit
 ) {
     val isUser = message.role == ChatRole.USER
+    var showImageDetails by remember(message.id) { mutableStateOf(false) }
+    val imageDetails = message.imageAnalysis ?: message.imageText
     Column(modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -233,19 +292,42 @@ private fun ChatBubble(
                     RoundedCornerShape(16.dp, 16.dp, 16.dp, 4.dp)
                 }
             ) {
-                Text(
-                    text = message.text,
-                    modifier = Modifier
-                        .widthIn(max = 300.dp)
-                        .padding(horizontal = 14.dp, vertical = 10.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (isUser) {
-                        MaterialTheme.colorScheme.onPrimary
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
+                Column(modifier = Modifier.widthIn(max = 300.dp).padding(horizontal = 14.dp, vertical = 10.dp)) {
+                    message.imageFileName?.let { name ->
+                        ChatImagePreview(name)
+                        Spacer(Modifier.height(8.dp))
                     }
-                )
+                    Text(
+                        text = message.text,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (isUser) {
+                            MaterialTheme.colorScheme.onPrimary
+                        } else {
+                            MaterialTheme.colorScheme.onSurface
+                        }
+                    )
+                    if (imageDetails != null) {
+                        TextButton(onClick = { showImageDetails = !showImageDetails }) {
+                            Text(if (showImageDetails) "收起识别结果" else if (message.imageAnalysis != null) "查看识别日程" else "查看识别文字",
+                                color = if (isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.primary)
+                        }
+                        if (showImageDetails) {
+                            Text(imageDetails.ifBlank { "未识别到日程信息" }, style = MaterialTheme.typography.bodySmall,
+                                color = if (isUser) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface)
+                        }
+                    }
+                }
             }
+        }
+
+        if (!isUser && message.tokenUsage != null) {
+            Text(
+                text = "本次消耗 ${message.tokenUsage} tokens",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.outline,
+                modifier = Modifier.align(if (isUser) Alignment.End else Alignment.Start)
+            )
+            Spacer(Modifier.height(2.dp))
         }
 
         if (!isUser && message.warnings.isNotEmpty()) {
@@ -270,6 +352,7 @@ private fun ChatBubble(
                     message.actions.forEachIndexed { index, event ->
                         ActionRow(
                             event = event,
+                            knownEvents = knownEvents,
                             onEdit = { onEditAction(index) },
                             onRemove = { onRemoveAction(index) }
                         )
@@ -301,11 +384,35 @@ private fun ChatBubble(
 }
 
 @Composable
+@android.annotation.SuppressLint("ProduceStateDoesNotAssignValue") // Kotlin 2 lint false positive: the producer assigns value below.
+private fun ChatImagePreview(fileName: String) {
+    val context = LocalContext.current
+    val images = remember(context) { ChatImageStore(context) }
+    val preview by produceState<Pair<Boolean, Bitmap?>>(false to null, fileName) {
+        value = true to images.thumbnail(fileName)
+    }
+    val bitmap = preview.second
+    if (bitmap != null) {
+        Image(bitmap = bitmap.asImageBitmap(), contentDescription = "日程图片预览",
+            modifier = Modifier.sizeIn(maxWidth = 260.dp, maxHeight = 160.dp))
+    } else {
+        Text(if (preview.first) "图片预览不可用" else "正在加载图片…", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
 private fun ActionRow(
     event: ParsedEvent,
+    knownEvents: List<CalendarEvent>,
     onEdit: () -> Unit,
     onRemove: () -> Unit
 ) {
+    // 与已有日程（不含自身和全天日程）的时间重叠检测
+    val conflicts = if (event.action == ParsedActionType.DELETE) emptyList()
+    else knownEvents.filter {
+        it.eventId != event.targetEventId && !it.allDay &&
+            it.startMillis < event.endMillis && it.endMillis > event.startMillis
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
             ActionBadge(event.action)
@@ -324,6 +431,16 @@ private fun ActionRow(
                     text = it,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (conflicts.isNotEmpty()) {
+                val shown = conflicts.take(2).joinToString("、") {
+                    "「${it.title}」${AppDateFormat.timeRange(it.startMillis, it.endMillis)}"
+                }
+                Text(
+                    text = "⚠ 时间重叠：" + shown + if (conflicts.size > 2) " 等 ${conflicts.size} 个日程" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
                 )
             }
             if (event.checklist.isNotEmpty()) {
