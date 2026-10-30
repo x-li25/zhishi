@@ -1,0 +1,14 @@
+# ---- 与「知时」App 无关的内容（见 unrelated/README.md） ----
+# 只保留清单说明，其余内容不进版本库
+/unrelated/*
+!/unrelated/README.md
+
+# ---- 本机构建工具链（Android SDK / Gradle 发行包，勿提交） ----
+/_tools/
+
+# ---- 常见本机产物 ----
+*.hprof
+*.asv
+.idea/
+.DS_Store
+Thumbs.db
