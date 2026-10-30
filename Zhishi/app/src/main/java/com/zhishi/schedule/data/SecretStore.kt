@@ -9,8 +9,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class SecretStore {
-    private val keyAlias = "zhishi_api_key_v1"
+class SecretStore(private val keyAlias: String = "zhishi_api_key_v1", private val label: String = "API Key") {
     private val transformation = "AES/GCM/NoPadding"
 
     fun encrypt(plainText: String): String {
@@ -36,7 +35,7 @@ class SecretStore {
             cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, iv))
             String(cipher.doFinal(payload), Charsets.UTF_8)
         }.getOrElse {
-            throw IllegalStateException("API Key 解密失败（可能因系统重装或备份恢复），请重新填写")
+            throw IllegalStateException("$label 解密失败（可能因系统重装或备份恢复），请重新填写")
         }
     }
 
